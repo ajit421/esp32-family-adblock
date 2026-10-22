@@ -1,0 +1,5 @@
+# Built lists, downloaded sources, the last-deployed copy and upload backups
+out/
+deployed/
+backups/
+*.bin

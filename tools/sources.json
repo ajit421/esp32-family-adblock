@@ -1,0 +1,22 @@
+{
+  "lists": [
+    {"id": "stevenblack-base", "name": "StevenBlack hosts (ads + malware)", "category": "ads", "enabled": false,
+     "url": "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"},
+    {"id": "stevenblack-porn", "name": "StevenBlack hosts + porn (includes the base list)", "category": "adult", "enabled": true,
+     "url": "https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/porn/hosts"},
+    {"id": "hagezi-light", "name": "Hagezi Light (ads + trackers)", "category": "ads", "enabled": true,
+     "url": "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/light-onlydomains.txt"},
+    {"id": "hagezi-pro", "name": "Hagezi Pro (ads + trackers, aggressive)", "category": "ads", "enabled": false,
+     "url": "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/pro-onlydomains.txt"},
+    {"id": "adguard-dns", "name": "AdGuard DNS filter", "category": "ads", "enabled": false,
+     "url": "https://raw.githubusercontent.com/AdguardTeam/HostlistsRegistry/main/filters/general/filter_1_DnsFilter/filter.txt"},
+    {"id": "my-block", "name": "My blocked domains (my-block.txt)", "category": "custom", "enabled": true, "file": "my-block.txt"},
+    {"id": "my-allow", "name": "My allowed domains (my-allow.txt)", "category": "allow", "enabled": true, "file": "my-allow.txt"}
+  ],
+  "presets": {
+    "repo-default": ["stevenblack-base", "hagezi-light"],
+    "ads+adult":    ["stevenblack-porn", "hagezi-light"],
+    "adguard-only": ["adguard-dns"],
+    "max":          ["stevenblack-base", "stevenblack-porn", "hagezi-light", "hagezi-pro", "adguard-dns"]
+  }
+}

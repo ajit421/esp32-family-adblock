@@ -1,0 +1,3 @@
+# Your own blocked domains, one per line. A domain also blocks its subdomains.
+# Lines starting with # are ignored. Example:
+# ads.example.com

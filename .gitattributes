@@ -1,0 +1,6 @@
+# Store text files with LF line endings in the repo (your working copy keeps your OS's style).
+* text=auto
+
+# Binary files: never touch line endings, never diff.
+*.bin binary
+*.stl binary

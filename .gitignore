@@ -1,0 +1,46 @@
+# PlatformIO build output
+.pio/
+.vscode/
+
+# macOS metadata
+.DS_Store
+._*
+
+# VS Code workspace file
+*.code-workspace
+
+# Generated blocklist (build it with tools/build_blocklist.py)
+data/blocklist.bin
+# Files packed into a USB filesystem image (tools/update.py --to-data writes them)
+data/blocklist.json
+data/upstream.cfg
+
+# WiFi credentials (copy src/secrets.example.h -> src/secrets.h)
+src/secrets.h
+
+# Backups / scratch
+*.bak
+
+# Python bytecode (tests and the toolkit create it)
+__pycache__/
+
+# Python virtual environments
+.venv/
+venv/
+
+# Windows metadata
+Thumbs.db
+desktop.ini
+
+# ---- Local-only files: never commit ----
+# Firmware and blocklist images. Firmware builds contain the passwords from src/secrets.h
+# as plain text, so never commit or publish a .bin you built (a public release must be built
+# with the placeholder secrets.example.h, like the CI does).
+*.bin
+
+# Private notes with real network details (Wi-Fi name, MACs, test log) and local backups.
+/CLAUDE.md
+/SETUP.md
+/test.md
+/backups/
+/_before-github/

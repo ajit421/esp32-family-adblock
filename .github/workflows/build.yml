@@ -1,0 +1,45 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  firmware:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - uses: actions/cache@v6
+        with:
+          path: ~/.platformio
+          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+      - run: pip install -U platformio
+      - name: Placeholder secrets (real ones are gitignored; the firmware falls back to the setup portal)
+        run: cp src/secrets.example.h src/secrets.h
+      - run: pio run -e esp32dev
+      - name: Firmware must fit the 0x150000 OTA slot (PlatformIO's "Flash x%" does not check this)
+        run: |
+          size=$(stat -c%s .pio/build/esp32dev/firmware.bin)
+          echo "firmware.bin = $size bytes, slot = 1376256 bytes"
+          test "$size" -le 1376256
+
+  blocklist-tool:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Parse hosts, plain and AdGuard-style input
+        run: |
+          printf '||ads.example.com^\n@@||ok.example.org^\n||ok.example.org^\n0.0.0.0 hosts.example.com\nplain.example.com\n/^regex$/\n' > t.txt
+          python3 tools/build_blocklist.py t.bin t.txt
+          test "$(stat -c%s t.bin)" -eq 15   # 3 entries x 5 bytes
+      - name: Unit tests
+        run: python3 -m unittest discover -s tools -p 'test_*.py' -v
+      - name: Toolkit starts (imports and argument parsing)
+        run: python3 tools/update.py --help

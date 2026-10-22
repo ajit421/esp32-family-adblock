@@ -1,0 +1,4 @@
+# Domains to remove from the built list (false positives), one per line.
+# This removes the exact entry only. To also allow subdomains, add the name on the
+# dashboard: Lists tab -> ALLOWED EXCEPTIONS. Lines starting with # are ignored. Example:
+# app.link
