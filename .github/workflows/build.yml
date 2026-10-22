@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
 
+# Least privilege: the workflow only reads the code (no secrets are used), so pull requests
+# from forks of this public repo get a read-only token.
+permissions:
+  contents: read
+
 jobs:
   firmware:
     runs-on: ubuntu-latest
