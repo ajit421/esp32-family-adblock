@@ -17,6 +17,9 @@
 #include <Preferences.h>       // NVS store for provisioned WiFi creds
 #include "lwip/etharp.h"
 #include "lwip/netif.h"
+#include "lwip/udp.h"           // DNS traffic on raw lwIP UDP (see "receiving" below)
+#include "lwip/tcpip.h"
+#include "freertos/ringbuf.h"
 #include "esp_ota_ops.h"       // is there an OTA slot? (dashboard hides the firmware upload if not)
 #include "esp_timer.h"         // 64-bit uptime: millis() wraps after 49.7 days
 #include "secrets.h"   // WIFI_SSID / WIFI_PASS — used only as a FALLBACK if no creds
@@ -57,11 +60,11 @@ static const char* BLOCKLIST_PATH = "/blocklist.bin";
 static const int HASH_BYTES = 5;
 static const uint64_t HASH_MASK = (1ULL << (HASH_BYTES * 8)) - 1;
 static const int INDEX_ENTRIES = 4096;   // 20 KB first-level flash index
-static const int CACHE_SIZE = 256;       // must be power of 2
+static const int CACHE_BITS = 10;        // 1024-entry result cache, 4 KB
 static const int MAX_RANGE = 256;        // max hashes per index bucket (fine up to ~1M hashes; flash holds far fewer)
 
 // ---- globals ----
-WiFiUDP dnsServer, probeCli;            // probeCli: only the blocking lookups of /test and the /setupstream probe
+WiFiUDP probeCli;                       // only the blocking lookups of /test and the /setupstream probe
 WebServer web(80);
 File blocklist;
 uint32_t numHashes = 0, totalBlocked = 0, totalAllowed = 0, totalFailovers = 0, totalServfail = 0;
@@ -79,22 +82,16 @@ static uint8_t qsave[sizeof(buf)];   // the client's query, kept so it can be re
 Upstream ups[MAX_UPSTREAMS]; int numUps = 0;
 static uint32_t upSecs() { return (uint32_t)(esp_timer_get_time() / 1000000ULL); }
 
-// first-level flash index (sorted sample hashes) + small direct-mapped cache
+// first-level flash index (sorted sample hashes) + direct-mapped result cache. A cache slot is picked by the low
+// CACHE_BITS of a hash, so it only stores the other 30 bits, plus "valid" (bit 1) and "listed" (bit 0).
 static uint8_t blIndex[INDEX_ENTRIES][HASH_BYTES];
-static uint8_t cacheKey[CACHE_SIZE][HASH_BYTES];
-static uint8_t cacheRes[CACHE_SIZE];
-static uint8_t cacheValid[CACHE_SIZE];
+static uint32_t flashCache[1 << CACHE_BITS];
 static uint8_t rangeBuf[MAX_RANGE * HASH_BYTES];
 
-struct Dev { uint32_t ip; uint8_t mac[6]; uint32_t blocked, allowed, lastSeen; bool banned; String label; };
+struct Dev { uint32_t ip; uint8_t mac[6]; uint32_t blocked, allowed; bool banned; };
 static const int MAX_CLIENTS = 96;
 Dev clients[MAX_CLIENTS]; int numClients = 0;
 
-static const int MAX_CUSTOM = 200;
-String customDom[MAX_CUSTOM]; uint64_t customHash[MAX_CUSTOM]; int numCustom = 0;
-// Allow list: exceptions for false positives. Checked before custom blocks and the blocklist.
-static const int MAX_ALLOW = 200;
-String allowDom[MAX_ALLOW]; uint64_t allowHash[MAX_ALLOW]; int numAllow = 0;
 // The local blocklist can be switched off as a filter (DNS tab); saved in /filter.cfg. Custom blocks,
 // exceptions and bans keep working either way.
 bool listOn = true;
@@ -139,18 +136,14 @@ static inline uint64_t unpackHash(const uint8_t* b) {
   for (int k = 0; k < HASH_BYTES; k++) v |= (uint64_t)b[k] << (8 * k);
   return v;
 }
-static inline void packHash(uint64_t h, uint8_t* b) {
-  for (int k = 0; k < HASH_BYTES; k++) { b[k] = (uint8_t)h; h >>= 8; }
-}
-
 static void buildFlashIndex() {
+  memset(flashCache, 0, sizeof(flashCache));
   if (!blocklist || numHashes == 0) return;
   for (int i = 0; i < INDEX_ENTRIES; i++) {
     uint32_t pos = (uint32_t)((uint64_t)i * (numHashes - 1) / (INDEX_ENTRIES - 1));
     blocklist.seek((uint32_t)pos * HASH_BYTES);
     blocklist.read(blIndex[i], HASH_BYTES);
   }
-  for (int i = 0; i < CACHE_SIZE; i++) cacheValid[i] = 0;
 }
 
 static bool inFlash(uint64_t h) {
@@ -190,26 +183,54 @@ static bool inFlash(uint64_t h) {
   return false;
 }
 
-static bool inHashes(const uint64_t* hs, int n, uint64_t h) { for (int i = 0; i < n; i++) if (hs[i] == h) return true; return false; }
-
 // Only flash results are cached: the flash list only changes via reopenBlocklist(), which
 // rebuilds the index and clears the cache. Custom and allow domains change at runtime, so
 // they're checked uncached (a short linear scan) to avoid serving stale answers.
 static bool inFlashCached(uint64_t h) {
   if (numHashes == 0) return false;                 // no list, or mid-swap: don't trust the cache
-  uint32_t slot = h & (CACHE_SIZE - 1);
-  if (cacheValid[slot]) {
-    uint8_t want[HASH_BYTES]; packHash(h, want);
-    bool same = true;
-    for (int k = 0; k < HASH_BYTES; k++) if (cacheKey[slot][k] != want[k]) { same = false; break; }
-    if (same) return cacheRes[slot] != 0;
-  }
-  bool res = inFlash(h);
-  cacheValid[slot] = 1;
-  cacheRes[slot] = res ? 1 : 0;
-  packHash(h, cacheKey[slot]);
+  uint32_t& c = flashCache[h & ((1 << CACHE_BITS) - 1)];
+  const uint32_t key = (uint32_t)(h >> CACHE_BITS) << 2 | 2;
+  if ((c & ~1u) == key) return c & 1;
+  const bool res = inFlash(h); c = key | res;
   return res;
 }
+
+// Custom block list (/custom.txt) and allow list (/allow.txt, exceptions for false positives): one domain per line.
+// Only plain names are kept (letters, digits, . - _, the same rule as /test): a pasted hosts line
+// ("0.0.0.0<TAB>ads.x.com") or a line break used to be stored as-is, broke /stats.json, and after a restart
+// split into a different name.
+static const int MAX_LIST = 200;
+static const char* NOT_ADDED = "not added: enter a domain like ads.example.com (letters, digits, . - _ only), not already listed, max 200";
+static bool cleanDomain(String& d) {
+  d.trim(); d.toLowerCase(); if (d.endsWith(".")) d.remove(d.length() - 1); if (d.startsWith("www.")) d = d.substring(4);
+  if (d.length() < 3 || d.length() > 253 || d.indexOf('.') <= 0 || d.endsWith(".") || d.indexOf("..") >= 0) return false;
+  for (char ch : d) if (!isalnum((unsigned char)ch) && ch != '.' && ch != '-' && ch != '_') return false;
+  return true;
+}
+struct DomainList {
+  const char* path; String dom[MAX_LIST]; uint64_t hash[MAX_LIST]; int n = 0;
+  explicit DomainList(const char* p) : path(p) {}       // set at start-up: a constant initializer put 2 x 4.8 KB into the flash image
+  bool has(uint64_t h) const { for (int i = 0; i < n; i++) if (hash[i] == h) return true; return false; }
+  void save() const { File f = LittleFS.open(path, "w"); if (!f) return; for (int i = 0; i < n; i++) f.println(dom[i]); f.close(); }
+  bool add(String d) {
+    if (!cleanDomain(d) || n >= MAX_LIST) return false;
+    for (int i = 0; i < n; i++) if (dom[i] == d) return false;
+    dom[n] = d; hash[n++] = fnv40(d.c_str(), d.length()); save(); return true;
+  }
+  void load() {                                     // bad lines from older firmware are dropped
+    n = 0; File f = LittleFS.open(path, "r"); if (!f) return;
+    while (f.available() && n < MAX_LIST) { String l = f.readStringUntil('\n'); if (cleanDomain(l)) { dom[n] = l; hash[n++] = fnv40(l.c_str(), l.length()); } }
+    f.close();
+  }
+  void remove(String d) {
+    d.toLowerCase();
+    for (int i = 0; i < n; i++) if (dom[i] == d) {
+      for (int j = i; j < n - 1; j++) { dom[j] = dom[j + 1]; hash[j] = hash[j + 1]; }
+      n--; save(); return;
+    }
+  }
+};
+static DomainList customList{"/custom.txt"}, allowList{"/allow.txt"};
 
 // Why a name is (not) blocked. Each rule matches the name itself or any parent domain;
 // an allow entry wins over custom blocks and the blocklist.
@@ -225,11 +246,11 @@ static Verdict classify(const char* domain, const char** hit) {
     const char* next = dot + 1; if (!strchr(next, '.')) break; p = next;
   }
   uint32_t t = micros();
-  for (int i = 0; i < k; i++) if (inHashes(allowHash, numAllow, hs[i])) { tAllow.add(micros() - t); *hit = ps[i]; return V_ALLOW; }
+  for (int i = 0; i < k; i++) if (allowList.has(hs[i])) { tAllow.add(micros() - t); *hit = ps[i]; return V_ALLOW; }
   tAllow.add(micros() - t);
   Verdict v = V_PASS; uint32_t usCustom = 0, usList = 0;
   for (int i = 0; i < k && v == V_PASS; i++) {
-    t = micros(); const bool c = inHashes(customHash, numCustom, hs[i]); usCustom += micros() - t;
+    t = micros(); const bool c = customList.has(hs[i]); usCustom += micros() - t;
     if (c) { *hit = ps[i]; v = V_CUSTOM; break; }
     if (!listOn) continue;
     t = micros(); const bool l = inFlashCached(hs[i]); usList += micros() - t;
@@ -240,49 +261,11 @@ static Verdict classify(const char* domain, const char** hit) {
 }
 
 // ---------- persistence ----------
-// Custom block list (/custom.txt) and allow list (/allow.txt): one domain per line.
-// Only plain names are kept (letters, digits, . - _, the same rule as /test): a pasted hosts line
-// ("0.0.0.0<TAB>ads.x.com") or a line break used to be stored as-is, broke /stats.json, and after a restart
-// split into a different name.
-static const char* NOT_ADDED = "not added: enter a domain like ads.example.com (letters, digits, . - _ only), not already listed, max 200";
-static bool cleanDomain(String& d) {
-  d.trim(); d.toLowerCase(); if (d.endsWith(".")) d.remove(d.length() - 1); if (d.startsWith("www.")) d = d.substring(4);
-  if (d.length() < 3 || d.length() > 253 || d.indexOf('.') <= 0 || d.endsWith(".") || d.indexOf("..") >= 0) return false;
-  for (char ch : d) if (!isalnum((unsigned char)ch) && ch != '.' && ch != '-' && ch != '_') return false;
-  return true;
-}
-static void loadList(const char* path, String* dom, uint64_t* hash, int& n, int max) {
-  n = 0; File f = LittleFS.open(path, "r"); if (!f) return;
-  while (f.available() && n < max) {
-    String l = f.readStringUntil('\n');
-    if (cleanDomain(l)) { dom[n] = l; hash[n] = fnv40(l.c_str(), l.length()); n++; }   // bad lines from older firmware are dropped
-  }
-  f.close();
-}
-static void saveList(const char* path, const String* dom, int n) { File f = LittleFS.open(path, "w"); if (!f) return; for (int i = 0; i < n; i++) f.println(dom[i]); f.close(); }
-static bool addToList(String d, const char* path, String* dom, uint64_t* hash, int& n, int max) {
-  if (!cleanDomain(d) || n >= max) return false;
-  for (int i = 0; i < n; i++) if (dom[i] == d) return false;
-  dom[n] = d; hash[n] = fnv40(d.c_str(), d.length()); n++; saveList(path, dom, n); return true;
-}
-static void removeFromList(String d, const char* path, String* dom, uint64_t* hash, int& n) {
-  d.toLowerCase();
-  for (int i = 0; i < n; i++) if (dom[i] == d) {
-    for (int j = i; j < n - 1; j++) { dom[j] = dom[j+1]; hash[j] = hash[j+1]; }
-    n--; saveList(path, dom, n); return;
-  }
-}
-static void loadCustom() { loadList("/custom.txt", customDom, customHash, numCustom, MAX_CUSTOM); }
-static bool addCustom(String d) { return addToList(d, "/custom.txt", customDom, customHash, numCustom, MAX_CUSTOM); }
-static void removeCustom(String d) { removeFromList(d, "/custom.txt", customDom, customHash, numCustom); }
 static void loadFilterCfg() {
   File f = LittleFS.open("/filter.cfg", "r"); if (!f) return;
   String l = f.readStringUntil('\n'); l.trim(); listOn = l != "list off"; f.close();
 }
 static void saveFilterCfg() { File f = LittleFS.open("/filter.cfg", "w"); if (!f) return; f.println(listOn ? "list on" : "list off"); f.close(); }
-static void loadAllow() { loadList("/allow.txt", allowDom, allowHash, numAllow, MAX_ALLOW); }
-static bool addAllow(String d) { return addToList(d, "/allow.txt", allowDom, allowHash, numAllow, MAX_ALLOW); }
-static void removeAllow(String d) { removeFromList(d, "/allow.txt", allowDom, allowHash, numAllow); }
 static bool isBannedIP(uint32_t ip) { for (int i = 0; i < numBanned; i++) if (bannedIP[i] == ip) return true; return false; }
 static void loadBanned() {
   numBanned = 0; File f = LittleFS.open("/banned.txt", "r"); if (!f) return;
@@ -344,13 +327,13 @@ static void getMac(uint32_t ip, uint8_t* mac) {
 }
 static Dev* getClient(uint32_t ip) {
   for (int i = 0; i < numClients; i++) if (clients[i].ip == ip) {
-    Dev& c = clients[i]; c.lastSeen = millis();
+    Dev& c = clients[i];
     if (!(c.mac[0] | c.mac[1] | c.mac[2] | c.mac[3] | c.mac[4] | c.mac[5])) getMac(ip, c.mac);   // not in the ARP table at first sight
     return &c;
   }
   if (numClients < MAX_CLIENTS) {
     Dev* c = &clients[numClients++];
-    c->ip = ip; c->blocked = c->allowed = 0; c->lastSeen = millis(); c->banned = isBannedIP(ip); c->label = "";
+    c->ip = ip; c->blocked = c->allowed = 0; c->banned = isBannedIP(ip);
     getMac(ip, c->mac); return c;
   }
   return nullptr;
@@ -412,26 +395,37 @@ static int askUpstream(Upstream& u, int qlen, int ql, const char** why) {
   }
   u.fail++; return 0;
 }
-// Every upstream failed: answer SERVFAIL (question echoed, no records) instead of staying silent.
-static int buildServfail(int qlen, int ql) {
-  const int len = 12 + ql;
-  memcpy(buf, qsave, len);
-  buf[2] = 0x81; buf[3] = 0x82; if (!ql) { buf[4] = 0; buf[5] = 0; } buf[6] = 0; buf[7] = 0; buf[8] = 0; buf[9] = 0; buf[10] = 0; buf[11] = 0;
-  return len;
+// Every upstream failed: answer SERVFAIL (query q's question echoed, no records) instead of staying silent.
+static int servfail(const uint8_t* q, int ql) {
+  memcpy(buf, q, 12 + ql); buf[2] = 0x81; buf[3] = 0x82; if (!ql) { buf[4] = 0; buf[5] = 0; } memset(buf + 6, 0, 6);
+  return 12 + ql;
 }
-// The last few upstream failures, for the DNS tab: otherwise the reason only reaches the serial log.
-struct Fail { uint32_t at; IPAddress ip; char why[10]; char name[48]; };
-static const int MAX_FAILS = 10;
-static Fail fails[MAX_FAILS]; static int numFails = 0, failNext = 0;
-static void noteFail(const IPAddress& ip, const char* why, const char* name) {
-  Fail& f = fails[failNext]; f.at = upSecs(); f.ip = ip; strlcpy(f.why, why, sizeof(f.why)); strlcpy(f.name, name, sizeof(f.name));
-  failNext = (failNext + 1) % MAX_FAILS; if (numFails < MAX_FAILS) numFails++;
-}
+// The last 10 names each filter acted on, for the DNS tab (/recent.json): blocked by the list or a custom rule, let
+// through by an exception, asked by a banned device, or failed at a server (otherwise the reason only reaches the
+// serial log). One row per name and client, newest first: a repeat (a name's A, AAAA and HTTPS lookups) moves its row
+// to the top and counts it, so one busy name can't push the others out.
+static const char* nameTail(const char* s, size_t max) { const size_t l = strlen(s); return l > max ? s + l - max : s; }   // keep the domain end
+struct Recent { uint32_t at, ip; uint16_t n; uint8_t hit; char why[10]; char name[64]; };   // hit: where the matched rule starts in name
+static const int RECENT_N = 10;
+struct RecentLog {
+  Recent e[RECENT_N]; int n = 0;
+  void add(uint32_t ip, const char* name, const char* hit, const char* why) {
+    const char* keep = nameTail(name, sizeof(e[0].name) - 1);
+    int j = 0; while (j < n && (e[j].ip != ip || strcmp(e[j].name, keep) != 0)) j++;
+    Recent r = j < n ? e[j] : Recent{};
+    if (j == n) { if (n < RECENT_N) n++; else j = RECENT_N - 1; }   // a new name drops the oldest when full
+    memmove(&e[1], &e[0], j * sizeof(Recent));
+    r.at = upSecs(); r.ip = ip; if (r.n < 0xFFFF) r.n++; r.hit = hit && hit > keep ? hit - keep : 0;
+    strlcpy(r.why, why, sizeof(r.why)); strlcpy(r.name, keep, sizeof(r.name));
+    e[0] = r;
+  }
+};
+static RecentLog recentList, recentCustom, recentAllow, recentBan, recentUp[MAX_UPSTREAMS];   // recentUp[i]: ups[i]'s failures
 // Blocking forward, for /test and the rare query too big for a pending slot: try each upstream in order, moving on
 // only when one fails. The client's txid is restored on the way back; each upstream's own answer (incl. its block
 // page) passes through unchanged.
 static int lastUp = -1;                                  // which upstream answered the last forward (-1: none)
-static int forwardUpstream(int qlen, int qend, const char* domain) {
+static int forwardUpstream(int qlen, int qend, const char* domain, uint32_t cip) {
   memcpy(qsave, buf, qlen);                              // buf gets overwritten by replies
   const int ql = (qend > 12 && qend <= qlen) ? qend - 12 : 0;
   lastUp = -1;
@@ -441,10 +435,10 @@ static int forwardUpstream(int qlen, int qend, const char* domain) {
     if (n > 0) { buf[0] = qsave[0]; buf[1] = qsave[1]; lastUp = i; markFirmwareGood("answered a lookup"); return n; }
     const bool last = i + 1 == numUps;
     if (last) totalServfail++; else totalFailovers++;
-    noteFail(ups[i].ip, why, domain);
+    recentUp[i].add(cip, domain, nullptr, why);
     Serial.printf("[dns] %s %s for %s -> %s\n", ups[i].ip.toString().c_str(), why, domain, last ? "SERVFAIL" : ups[i + 1].ip.toString().c_str());
   }
-  return buildServfail(qlen, ql);
+  return servfail(qsave, ql);
 }
 // Cap the EDNS UDP size a query advertises at 1232 (the DNS Flag Day value). lwIP hands over at most 1460 bytes of
 // a datagram and drops fragmented ones (no IP reassembly), so bigger answers arrived cut off or not at all.
@@ -453,65 +447,92 @@ static void capEdns(uint8_t* q, int qlen, int qend) {
   if (((q[qend + 3] << 8) | q[qend + 4]) > 1232) { q[qend + 3] = 1232 >> 8; q[qend + 4] = 1232 & 0xFF; }
 }
 
+// ---------- receiving ----------
+// DNS traffic uses raw lwIP UDP. lwIP hands each datagram to onUdp() in its own task the moment it arrives, and it
+// is copied into a ring buffer for the loop. With sockets (WiFiUDP) lwIP queued only 6 datagrams per socket and the
+// loop fetched them one by one (a 1.5 KB malloc per poll, even when nothing had arrived), so of 16 lookups sent back
+// to back ~6 were answered: the rest were dropped before the firmware ever saw them.
+struct RxHdr { uint32_t ip; uint16_t port, sock; };      // sock: 0 = a client lookup (port 53), s + 1 = upstream socket s
+static RingbufHandle_t qRing, upRing;                   // client lookups / upstream replies
+static SemaphoreHandle_t rxWake;                        // given on every arrival, so an idle loop wakes at once
+static udp_pcb* dnsPcb;
+static void onUdp(void* arg, udp_pcb*, pbuf* p, const ip_addr_t* a, u16_t port) {
+  const uint16_t sock = (uintptr_t)arg; RingbufHandle_t ring = sock ? upRing : qRing; void* it;
+  if (IP_IS_V4(a) && p->tot_len <= sizeof(buf) && xRingbufferSendAcquire(ring, &it, sizeof(RxHdr) + p->tot_len, 0) == pdTRUE) {
+    *(RxHdr*)it = RxHdr{ip4_addr_get_u32(ip_2_ip4(a)), port, sock};
+    pbuf_copy_partial(p, (uint8_t*)it + sizeof(RxHdr), p->tot_len, 0);
+    xRingbufferSendComplete(ring, it); xSemaphoreGive(rxWake);
+  }
+  pbuf_free(p);                                         // ring full: dropped, as a full socket would
+}
+static udp_pcb* udpOpen(uint16_t port, uintptr_t sock) {   // port 0: a random one
+  LOCK_TCPIP_CORE(); udp_pcb* pcb = udp_new(); udp_bind(pcb, IP4_ADDR_ANY, port); udp_recv(pcb, onUdp, (void*)sock); UNLOCK_TCPIP_CORE();
+  return pcb;
+}
+static void udpSend(udp_pcb* pcb, uint32_t ip, uint16_t port, int n) {   // buf[0..n)
+  LOCK_TCPIP_CORE();
+  if (pbuf* p = pbuf_alloc(PBUF_TRANSPORT, n, PBUF_RAM)) { memcpy(p->payload, buf, n); ip_addr_t a = IPADDR4_INIT(ip); udp_sendto(pcb, p, &a, port); pbuf_free(p); }
+  UNLOCK_TCPIP_CORE();
+}
+static int takeRx(RingbufHandle_t ring, RxHdr& h) {     // next datagram -> buf; its length, or -1 if none
+  size_t sz; uint8_t* it = (uint8_t*)xRingbufferReceive(ring, &sz, 0); if (!it) return -1;
+  memcpy(&h, it, sizeof(h)); const int n = sz - sizeof(h); memcpy(buf, it + sizeof(h), n); vRingbufferReturnItem(ring, it);
+  return n;
+}
+
 // ---------- forwarding without waiting ----------
 // Lookups used to be forwarded one at a time: the loop waited for every upstream answer, so a slow or dead server
-// made each lookup in the house queue behind the previous one (dead first server: 0.5-0.8 s each), and as lwIP keeps
-// only 6 datagrams per socket, 23 of 30 simultaneous lookups were simply lost. Now a forwarded query takes a slot and
-// the loop keeps serving; replies and timeouts are handled as they come. A good answer from a server that was
-// already given up on is still taken (it used to be thrown away).
+// made each lookup in the house queue behind the previous one (dead first server: 0.5-0.8 s each). Now a forwarded
+// query takes a slot and the loop keeps serving; replies and timeouts are handled as they come. A good answer from a
+// server that was already given up on is still taken (it used to be thrown away).
 static const int MAX_PENDING = 16, MAX_Q = 512, NUM_SOCKS = 4;
 struct Pending {
-  bool used; IPAddress cip; uint16_t cport, cid, uid, qlen, ql; uint8_t up, sock, tried;   // tried: one bit per upstream asked
-  uint32_t sentAt[MAX_UPSTREAMS]; char name[48]; uint8_t q[MAX_Q];
+  bool used; uint32_t cip; uint16_t cport, cid, uid, qlen, ql; uint8_t up, sock, tried;   // tried: one bit per upstream asked
+  uint32_t sentAt[MAX_UPSTREAMS]; char name[64]; uint8_t q[MAX_Q];
 };
 static Pending pend[MAX_PENDING];
-static WiFiUDP upSock[NUM_SOCKS];                        // 4 sockets = 4 x 6 datagrams of lwIP buffer for replies
+static udp_pcb* upSock[NUM_SOCKS];                       // a txid only has to be unique per socket
 static uint32_t rotatedAt = 0;
 static void sendTo(Pending& p, int i) {                  // (re)send p's query to upstream i, under p's own txid
   p.up = i; p.tried |= 1 << i; p.sentAt[i] = millis();
   memcpy(buf, p.q, p.qlen); buf[0] = p.uid >> 8; buf[1] = p.uid & 0xFF;
-  WiFiUDP& s = upSock[p.sock]; s.beginPacket(ups[i].ip, UPSTREAM_PORT); s.write(buf, p.qlen); s.endPacket();
+  udpSend(upSock[p.sock], (uint32_t)ups[i].ip, UPSTREAM_PORT, p.qlen);
 }
 static void answerClient(Pending& p, int n) {            // reply in buf[0..n) -> the client, under its own txid
   buf[0] = p.cid >> 8; buf[1] = p.cid & 0xFF;
-  dnsServer.beginPacket(p.cip, p.cport); dnsServer.write(buf, n); dnsServer.endPacket(); p.used = false;
+  udpSend(dnsPcb, p.cip, p.cport, n); p.used = false;
 }
 static void upstreamFailed(Pending& p, const char* why) {   // the current upstream failed: the next one, or SERVFAIL after the last
   const int i = p.up; const bool last = i + 1 >= numUps;
   ups[i].fail++; if (last) totalServfail++; else totalFailovers++;
-  noteFail(ups[i].ip, why, p.name);
+  recentUp[i].add(p.cip, p.name, nullptr, why);
   Serial.printf("[dns] %s %s for %s -> %s\n", ups[i].ip.toString().c_str(), why, p.name, last ? "SERVFAIL" : ups[i + 1].ip.toString().c_str());
-  if (!last) { sendTo(p, i + 1); return; }
-  memcpy(buf, p.q, 12 + p.ql); buf[2] = 0x81; buf[3] = 0x82; if (!p.ql) { buf[4] = 0; buf[5] = 0; } memset(buf + 6, 0, 6);
-  answerClient(p, 12 + p.ql);
+  if (!last) sendTo(p, i + 1); else answerClient(p, servfail(p.q, p.ql));
 }
-static void forwardAsync(Pending& p, const IPAddress& cip, uint16_t cport, int qlen, int qend, const char* name) {
+static void forwardAsync(Pending& p, uint32_t cip, uint16_t cport, int qlen, int qend, const char* name) {
   p.used = true; p.cip = cip; p.cport = cport; p.cid = (buf[0] << 8) | buf[1]; p.qlen = qlen;
   p.ql = (qend > 12 && qend <= qlen) ? qend - 12 : 0; p.tried = 0; p.sock = (&p - pend) % NUM_SOCKS;
-  strlcpy(p.name, name, sizeof(p.name)); memcpy(p.q, buf, qlen);
+  strlcpy(p.name, nameTail(name, sizeof(p.name) - 1), sizeof(p.name)); memcpy(p.q, buf, qlen);
   for (bool taken = true; taken; ) {                     // a txid no other query on this socket is waiting for
     p.uid = (uint16_t)esp_random(); taken = false;
     for (const Pending& x : pend) if (&x != &p && x.used && x.sock == p.sock && x.uid == p.uid) taken = true;
   }
   sendTo(p, 0);
 }
-static bool inFlight(const IPAddress& cip, uint16_t cport, uint16_t cid) {   // the router re-sends what it still waits for
+static bool inFlight(uint32_t cip, uint16_t cport, uint16_t cid) {   // the router re-sends what it still waits for
   for (const Pending& p : pend) if (p.used && p.cid == cid && p.cport == cport && p.cip == cip) return true;
   return false;
 }
 // Same checks as askUpstream: txid, source address/port, question echo; SERVFAIL/REFUSED/malformed = failure.
 static bool pollUpstreams() {
-  bool did = false;
-  for (int s = 0; s < NUM_SOCKS; s++) for (int budget = 0; budget < 8; budget++) {
-    WiFiUDP& u = upSock[s]; if (u.parsePacket() <= 0) break;
+  bool did = false; RxHdr h;
+  for (int n; (n = takeRx(upRing, h)) >= 0; ) {
     did = true;
-    const IPAddress from = u.remoteIP(); const uint16_t fport = u.remotePort();
-    const int n = u.read(buf, sizeof(buf)); u.clear();
-    if (n < 12 || fport != UPSTREAM_PORT || !(buf[2] & 0x80)) continue;
-    const uint16_t id = (buf[0] << 8) | buf[1];
+    if (n < 12 || h.port != UPSTREAM_PORT || !(buf[2] & 0x80)) continue;
+    const int s = h.sock - 1; const uint16_t id = (buf[0] << 8) | buf[1];
     Pending* p = nullptr; for (Pending& x : pend) if (x.used && x.sock == s && x.uid == id) { p = &x; break; }
     if (!p) continue;                                    // nobody waits for it (already answered, or stray)
-    int i = -1; for (int k = 0; k < numUps; k++) if ((p->tried >> k & 1) && ups[k].ip == from) { i = k; break; }
+    int i = -1; for (int k = 0; k < numUps; k++) if ((p->tried >> k & 1) && (uint32_t)ups[k].ip == h.ip) { i = k; break; }
     if (i < 0) continue;                                 // not from a server this query went to
     const char* bad = n < 12 + p->ql || memcmp(buf + 12, p->q + 12, p->ql) != 0 ? "malformed" : nullptr;
     const uint8_t rc = buf[3] & 0x0F; if (!bad && (rc == 2 || rc == 5)) bad = rc == 2 ? "SERVFAIL" : "REFUSED";
@@ -532,71 +553,51 @@ static void rotatePorts() {
   rotatedAt = millis();
   for (int s = 0; s < NUM_SOCKS; s++) {
     bool busy = false; for (const Pending& p : pend) if (p.used && p.sock == s) busy = true;
-    if (!busy) { upSock[s].stop(); upSock[s].begin(0); }
+    if (busy) continue;
+    LOCK_TCPIP_CORE(); udp_remove(upSock[s]); UNLOCK_TCPIP_CORE();
+    upSock[s] = udpOpen(0, s + 1);
   }
 }
 static void dropPending() { for (Pending& p : pend) p.used = false; }   // the upstream list changed; the router retries
 static Pending* freeSlot() { for (Pending& p : pend) if (!p.used) return &p; return nullptr; }
 
 // One client query in buf[0..qlen): answer it here (blocked, malformed) or hand it to a pending slot.
-static void processQuery(const IPAddress& cip, uint16_t cport, int qlen, Pending& slot) {
+static void processQuery(uint32_t cip, uint16_t cport, int qlen, Pending& slot) {
   if (qlen < 13 || (buf[2] & 0x80)) return;             // a response: never answer or forward it
   char domain[256]; uint16_t qtype = 0; int qend = qlen;
   const int dl = parseQuery(buf, qlen, domain, &qtype, &qend);
   if (dl < 0) {                                          // malformed: FORMERR now, instead of trying every upstream (1-1.6 s of stalled DNS each)
     buf[2] = 0x80 | (buf[2] & 0x79); buf[3] = 0x01; memset(buf + 4, 0, 8);
-    dnsServer.beginPacket(cip, cport); dnsServer.write(buf, 12); dnsServer.endPacket(); return;
+    udpSend(dnsPcb, cip, cport, 12); return;
   }
-  Dev* c = getClient((uint32_t)cip);
-  const bool ban = numBanned && isBannedIP((uint32_t)cip);   // also works when the client table is full
+  if (inFlight(cip, cport, (buf[0] << 8) | buf[1])) return;   // a repeat: not counted again (it used to inflate LIVE STATS)
+  Dev* c = getClient(cip);
+  const bool ban = numBanned && isBannedIP(cip);        // also works when the client table is full
   const char* hit = ""; Verdict v = V_PASS;
-  if (ban) locBan++;
+  if (ban) { locBan++; recentBan.add(cip, dl ? domain : ".", nullptr, ""); }
   else if (blockingOn && dl) {
     v = classify(domain, &hit); locChecked++;
     if (v == V_LIST) locList++; else if (v == V_CUSTOM) locCustom++; else if (v == V_ALLOW) locAllow++;
+    static RecentLog* const LOG[] = {nullptr, &recentAllow, &recentCustom, &recentList};   // by Verdict
+    if (LOG[v]) LOG[v]->add(cip, domain, hit, "");
   }
   if (ban || v >= V_CUSTOM) {
-    const int rlen = buildBlocked(qend, qtype); totalBlocked++; if (c) c->blocked++;
-    dnsServer.beginPacket(cip, cport); dnsServer.write(buf, rlen); dnsServer.endPacket(); return;
+    totalBlocked++; if (c) c->blocked++;
+    udpSend(dnsPcb, cip, cport, buildBlocked(qend, qtype)); return;
   }
-  if (inFlight(cip, cport, (buf[0] << 8) | buf[1])) return;
   totalAllowed++; if (c) c->allowed++;
   capEdns(buf, qlen, qend);
   if (qlen <= MAX_Q) { forwardAsync(slot, cip, cport, qlen, qend, dl ? domain : "?"); return; }
-  const int rlen = forwardUpstream(qlen, qend, dl ? domain : "?");   // a query over 512 bytes: the old blocking way
-  dnsServer.beginPacket(cip, cport); dnsServer.write(buf, rlen); dnsServer.endPacket();
+  udpSend(dnsPcb, cip, cport, forwardUpstream(qlen, qend, dl ? domain : "?", cip));   // a query over 512 bytes: the old blocking way
 }
 
-// A burst is read out of the socket first and worked through afterwards. lwIP keeps only 6 datagrams per socket and
-// checking a name against the flash list takes ~2.5 ms (up to 15), so of 30 lookups arriving 2 ms apart 22 were
-// dropped while the first ones were being checked; reading one out takes a small fraction of that.
-static const int RXQ = 24, RXQ_LEN = 300;
-struct RxQuery { IPAddress ip; uint16_t port, len; uint8_t d[RXQ_LEN]; };
-static RxQuery rxq[RXQ]; static int rxHead = 0, rxCount = 0;
-static bool drainDns() {
-  bool did = false;
-  while (rxCount < RXQ) {
-    const int sz = dnsServer.parsePacket(); if (sz <= 0) break;
-    did = true;
-    const IPAddress ip = dnsServer.remoteIP(); const uint16_t port = dnsServer.remotePort();
-    if (sz > RXQ_LEN) {                                  // rare big query: handle it right away from buf
-      const int n = dnsServer.read(buf, sizeof(buf)); dnsServer.clear();
-      if (Pending* s = freeSlot()) processQuery(ip, port, n, *s);
-      continue;
-    }
-    RxQuery& r = rxq[(rxHead + rxCount) % RXQ]; r.ip = ip; r.port = port;
-    r.len = dnsServer.read(r.d, sizeof(r.d)); dnsServer.clear(); rxCount++;
-  }
-  return did;
-}
 // Returns true if anything was handled (the loop only sleeps when nothing was).
 static bool handleDns() {
-  bool did = pollUpstreams() | drainDns();
-  for (int budget = 0; budget < 16 && rxCount; budget++) {
-    Pending* slot = freeSlot(); if (!slot) break;        // 16 lookups in flight: the rest wait in the queue
-    RxQuery& r = rxq[rxHead]; rxHead = (rxHead + 1) % RXQ; rxCount--;
-    memcpy(buf, r.d, r.len); processQuery(r.ip, r.port, r.len, *slot);
-    did |= drainDns();                                   // keep the socket empty while names are being checked
+  bool did = pollUpstreams(); RxHdr h;
+  for (int budget = 0; budget < 16; budget++) {
+    Pending* slot = freeSlot(); if (!slot) break;        // 16 lookups in flight: the rest wait in the ring
+    const int n = takeRx(qRing, h); if (n < 0) break;
+    processQuery(h.ip, h.port, n, *slot); did = true;
   }
   checkTimeouts();
   return did;
@@ -666,21 +667,40 @@ static void handleStats() {
              ",\"resumeIn\":" + (uint32_t)(!blockingOn && resumeAt ? (resumeAt - millis()) / 1000 : 0) +
              ",\"defcreds\":" + ((strcmp(WEB_PASS, "CHANGE_ME_WEB_PASSWORD") == 0 || strcmp(OTA_PASS, "CHANGE_ME_OTA_PASSWORD") == 0) ? "true" : "false") +
              ",\"clients\":[";
+  j.reserve(j.length() + numClients * 110 + numBanned * 20 + (customList.n + allowList.n) * 40 + numUps * 160 + 8);   // one allocation, not one per row
   for (int i = 0; i < numClients; i++) { Dev& c = clients[i]; IPAddress ip(c.ip);
     j += (i ? "," : ""); j += "{\"ip\":\"" + ip.toString() + "\",\"mac\":\"" + macStr(c.mac) + "\",\"blocked\":" + c.blocked + ",\"allowed\":" + c.allowed + ",\"banned\":" + (c.banned?"true":"false") + "}"; }
   j += "],\"bans\":[";                                // also bans of devices not seen since the restart (unban from the page)
   for (int i = 0; i < numBanned; i++) { j += (i ? ",\"" : "\""); j += IPAddress(bannedIP[i]).toString() + "\""; }
-  j += "],\"custom\":[";
-  for (int i = 0; i < numCustom; i++) { j += (i ? "," : ""); j += "\"" + jesc(customDom[i]) + "\""; }
-  j += "],\"allow\":[";
-  for (int i = 0; i < numAllow; i++) { j += (i ? "," : ""); j += "\"" + jesc(allowDom[i]) + "\""; }
+  auto names = [&j](const DomainList& l) { for (int i = 0; i < l.n; i++) { j += i ? ",\"" : "\""; j += jesc(l.dom[i]) + "\""; } };
+  j += "],\"custom\":["; names(customList);
+  j += "],\"allow\":["; names(allowList);
   j += "],\"ups\":[";
   for (int i = 0; i < numUps; i++) { Upstream& u = ups[i];
     j += (i ? "," : ""); j += "{\"ip\":\"" + u.ip.toString() + "\",\"name\":\"" + upName(u.ip) + "\",\"filtered\":" + (upFiltered(u.ip) ? "true" : "false") +
          ",\"to\":" + u.timeoutMs + ",\"ok\":" + u.ok + ",\"fail\":" + u.fail + ",\"avg\":" + (u.ok ? u.sumMs / u.ok : 0) + ",\"max\":" + u.maxMs + "}"; }
-  j += "],\"fails\":[";
-  for (int k = 0; k < numFails; k++) { const Fail& f = fails[(failNext - 1 - k + MAX_FAILS) % MAX_FAILS];   // newest first
-    j += (k ? "," : ""); j += "{\"ago\":" + String(up - f.at) + ",\"up\":\"" + f.ip.toString() + "\",\"why\":\"" + f.why + "\",\"name\":\"" + jesc(f.name) + "\"}"; }
+  j += "]}";
+  web.send(200, "application/json", j);
+}
+// /recent.json: the RecentLogs, in the LIVE STATS order. Kept out of /stats.json: only the DNS tab asks for it.
+static void jsonLog(String& j, const RecentLog& l, uint32_t now) {
+  j += '[';
+  for (int k = 0; k < l.n; k++) { const Recent& r = l.e[k];
+    j += k ? ",{\"ago\":" : "{\"ago\":"; j += now - r.at;
+    j += ",\"ip\":\"" + IPAddress(r.ip).toString() + "\",\"name\":\"" + jesc(r.name) + "\",\"hit\":" + r.hit + ",\"n\":" + r.n + ",\"why\":\"" + r.why + "\"}"; }
+  j += ']';
+}
+static void handleRecent() {
+  const uint32_t now = upSecs();
+  String j = "{\"list\":"; jsonLog(j, recentList, now);
+  j += ",\"custom\":"; jsonLog(j, recentCustom, now);
+  j += ",\"allow\":"; jsonLog(j, recentAllow, now);
+  j += ",\"ban\":"; jsonLog(j, recentBan, now);
+  j += ",\"ups\":[";                                  // name + ip with each log: the chain may change between two requests
+  for (int i = 0; i < numUps; i++) {
+    j += i ? ",{\"ip\":\"" : "{\"ip\":\""; j += ups[i].ip.toString() + "\",\"name\":\"" + upName(ups[i].ip) + "\",\"e\":";
+    jsonLog(j, recentUp[i], now); j += '}';
+  }
   j += "]}";
   web.send(200, "application/json", j);
 }
@@ -765,6 +785,7 @@ static void handleSetUpstream() {                   // /setupstream?u=1.1.1.3:25
   if (!alive) { web.send(400, "text/plain", "not saved: no server answered a test lookup: " + dead); return; }
   dropPending();                                    // their upstream indexes are about to change
   for (int i = 0; i < n; i++) ups[i] = tmp[i];       // fresh entries: per-server stats start at 0
+  for (RecentLog& l : recentUp) l.n = 0;             // and so do their recent failures (an index may now be another server)
   numUps = n; totalFailovers = totalServfail = 0; saveUpstreams();
   Serial.printf("[upstream] %d server(s), first %s\n", numUps, ups[0].ip.toString().c_str());
   web.send(200, "text/plain", dead.length() ? "ok, but no answer from " + dead : String("ok"));
@@ -816,16 +837,13 @@ static String answersOf(int n) {
 static void handleTest() {
   if (!requireAuth()) return;
   String d = web.arg("d"); d.trim(); d.toLowerCase(); if (d.endsWith(".")) d.remove(d.length() - 1);
-  bool ok = d.length() > 2 && d.length() < 250 && d.indexOf('.') > 0;
-  for (char ch : d) if (!isalnum((unsigned char)ch) && ch != '.' && ch != '-' && ch != '_') ok = false;
-  const int qlen = ok ? buildQueryA(d) : 0;
+  String m = d; const int qlen = cleanDomain(m) ? buildQueryA(d) : 0;   // m: d without www., as parseQuery() strips it
   if (!qlen) { web.send(400, "text/plain", "enter a domain like example.com"); return; }
-  const String m = d.startsWith("www.") ? d.substring(4) : d;   // same www. stripping as parseQuery()
   const char* hit = ""; const Verdict v = classify(m.c_str(), &hit);
   static const char* const VN[] = {"upstream", "allowed", "custom-block", "blocklist"};
   String j = "{\"domain\":\"" + jesc(d) + "\",\"verdict\":\"" + VN[v] + "\",\"match\":\"" + jesc(hit) + "\",\"blocking\":" + (blockingOn ? "true" : "false");
   if (v < V_CUSTOM || !blockingOn) {                 // the DNS path would forward this name
-    const uint32_t t0 = millis(); const int n = forwardUpstream(qlen, qlen, d.c_str());
+    const uint32_t t0 = millis(); const int n = forwardUpstream(qlen, qlen, d.c_str(), (uint32_t)web.client().remoteIP());
     j += ",\"ms\":" + String(millis() - t0);
     if (lastUp >= 0) {
       static const char* const RC[] = {"NOERROR", "FORMERR", "SERVFAIL", "NXDOMAIN", "NOTIMP", "REFUSED"};
@@ -837,7 +855,7 @@ static void handleTest() {
   web.send(200, "application/json", j + "}");
 }
 
-// ---------- blocklist swap (shared by upload + remote fetch) ----------
+// ---------- blocklist swap (upload) ----------
 // The partition holds one list, so we free the old one before writing the new.
 // While swapping, numHashes=0 -> device fail-opens (forwards, no blocking).
 static void reopenBlocklist() {
@@ -1047,14 +1065,9 @@ void setup() {
   { esp_ota_img_states_t st; fwPending = esp_ota_get_state_partition(esp_ota_get_running_partition(), &st) == ESP_OK && st == ESP_OTA_IMG_PENDING_VERIFY; }
   if (fwPending) Serial.println("[fw-ota] new firmware: not confirmed until it answers a lookup (a restart before that rolls back)");
   if (!LittleFS.begin(true)) Serial.println("LittleFS FAILED");
-  blocklist = LittleFS.open(BLOCKLIST_PATH, "r");
-  if (blocklist) {
-    numHashes = blocklist.size() / HASH_BYTES;
-    Serial.printf("blocklist: %u domains\n", numHashes);
-    buildFlashIndex();
-  }
-  loadCustom(); loadAllow(); loadBanned(); loadUpstreams(); loadFilterCfg();
-  Serial.printf("custom: %d, allow: %d, banned: %d, upstreams: %d (first %s), local list %s\n", numCustom, numAllow, numBanned, numUps, ups[0].ip.toString().c_str(), listOn ? "on" : "off");
+  reopenBlocklist(); customList.load(); allowList.load(); loadBanned(); loadUpstreams(); loadFilterCfg();
+  Serial.printf("blocklist: %u domains, custom: %d, allow: %d, banned: %d, upstreams: %d (first %s), local list %s\n", numHashes,
+                customList.n, allowList.n, numBanned, numUps, ups[0].ip.toString().c_str(), listOn ? "on" : "off");
 
   // Hold BOOT at power-on to wipe saved WiFi and force the setup portal.
 #if CONFIG_IDF_TARGET_ESP32C3
@@ -1081,7 +1094,11 @@ void setup() {
                     "(they're in the repo's example file). Set real values before trusting this "
                     "device on a network you don't fully control.");
 
-  dnsServer.begin(DNS_PORT); probeCli.begin(0); for (WiFiUDP& s : upSock) s.begin(0);
+  qRing = xRingbufferCreate(4096, RINGBUF_TYPE_NOSPLIT); upRing = xRingbufferCreate(6144, RINGBUF_TYPE_NOSPLIT);   // ~60 lookups / 16 replies
+  rxWake = xSemaphoreCreateBinary();
+  dnsPcb = udpOpen(DNS_PORT, 0); for (int s = 0; s < NUM_SOCKS; s++) upSock[s] = udpOpen(0, s + 1);
+  probeCli.begin(0);
+  web.enableDelay(false);                    // handleClient() slept 1 ms on every loop pass without an HTTP client, DNS too
   { const char* hdrs[] = { CSRF_HEADER }; web.collectHeaders(hdrs, 1); }  // needed for requireAuth()'s CSRF check
   // DNS rebinding: a page on a public domain whose name is later pointed at 192.168.1.10 could read /stats.json.
   // Answer only host names that can't come from the internet: this IP, one label, or .local/.lan/.home/.internal.
@@ -1095,6 +1112,7 @@ void setup() {
     web.sendHeader("Cache-Control", "no-store"); web.sendHeader("X-Frame-Options", "DENY");
     web.sendHeader("Content-Security-Policy", "frame-ancestors 'none'"); web.send_P(200, "text/html", PAGE); });
   web.on("/stats.json", handleStats);
+  web.on("/recent.json", handleRecent);
   web.on("/ban", handleBan);
   web.on("/setupstream", handleSetUpstream);
   web.on("/setlist", []() {                  // /setlist?on=1|0 : local blocklist on/off as a filter
@@ -1103,10 +1121,10 @@ void setup() {
     Serial.printf("[filter] local list %s\n", listOn ? "on" : "off");
     web.send(200, "text/plain", listOn ? "local list on" : "local list off");
   });
-  web.on("/addblock", []() { if (!requireAuth()) return; bool ok = addCustom(web.arg("d")); web.send(ok ? 200 : 400, "text/plain", ok ? "ok" : NOT_ADDED); });
-  web.on("/unblock", []() { if (!requireAuth()) return; removeCustom(web.arg("d")); web.send(200, "text/plain", "ok"); });
-  web.on("/addallow", []() { if (!requireAuth()) return; bool ok = addAllow(web.arg("d")); web.send(ok ? 200 : 400, "text/plain", ok ? "ok" : NOT_ADDED); });
-  web.on("/unallow", []() { if (!requireAuth()) return; removeAllow(web.arg("d")); web.send(200, "text/plain", "ok"); });
+  web.on("/addblock", []() { if (!requireAuth()) return; bool ok = customList.add(web.arg("d")); web.send(ok ? 200 : 400, "text/plain", ok ? "ok" : NOT_ADDED); });
+  web.on("/unblock", []() { if (!requireAuth()) return; customList.remove(web.arg("d")); web.send(200, "text/plain", "ok"); });
+  web.on("/addallow", []() { if (!requireAuth()) return; bool ok = allowList.add(web.arg("d")); web.send(ok ? 200 : 400, "text/plain", ok ? "ok" : NOT_ADDED); });
+  web.on("/unallow", []() { if (!requireAuth()) return; allowList.remove(web.arg("d")); web.send(200, "text/plain", "ok"); });
   web.on("/test", handleTest);
   web.on("/auth", []() { if (requireAuth()) web.send(200, "text/plain", "ok"); });   // the page logs in here before uploads
   web.on("/uploadmeta", HTTP_POST, handleMetaDone, handleMetaUpload);  // blocklist.json (auth inside)
@@ -1134,11 +1152,12 @@ void setup() {
 }
 
 void loop() {
-  ArduinoOTA.handle();
+  static uint32_t otaAt = 0;                 // ArduinoOTA's poll mallocs 1.5 KB each time: 10x a second is plenty
+  if (millis() - otaAt >= 100) { otaAt = millis(); ArduinoOTA.handle(); }
   web.handleClient();
   bool busy = handleDns();
   if (!blockingOn && resumeAt && (int32_t)(millis() - resumeAt) >= 0) { blockingOn = true; resumeAt = 0; }
   if (fwPending && millis() > 600000UL) markFirmwareGood("10 min uptime");
   rotatePorts();
-  if (!busy) delay(1);   // sleep only when idle: full speed under load, cool when quiet
+  if (!busy) xSemaphoreTake(rxWake, 1);   // idle: sleep up to 1 ms, but wake the moment a datagram arrives
 }

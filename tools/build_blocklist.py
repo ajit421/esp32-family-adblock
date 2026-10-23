@@ -103,12 +103,11 @@ def main():
     if skipped:
         print(f'skipped rules    : {skipped:,} (adblock syntax that a DNS hash list cannot express)', file=sys.stderr)
 
-    hashes = sorted(fnv(d.encode()) for d in domains)
-    collisions = len(hashes) - len(set(hashes))
+    hashes = [fnv(d.encode()) for d in domains]
     uniq = sorted(set(hashes))                       # one entry per distinct hash
+    collisions = len(hashes) - len(uniq)
     with open(out, 'wb') as f:
-        for h in uniq:
-            f.write(h.to_bytes(HASH_BYTES, 'little'))
+        f.write(b''.join(h.to_bytes(HASH_BYTES, 'little') for h in uniq))
 
     n, size = len(uniq), len(uniq) * HASH_BYTES
     print(f'source domains   : {len(domains):,}')

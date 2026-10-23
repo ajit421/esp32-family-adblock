@@ -24,6 +24,7 @@ button:hover{background:#30363d}button.p{background:#238636;border-color:#2ea043
 input,select{background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:5px;padding:6px}
 h2{font-size:13px;color:#8b949e;margin:18px 0 8px;letter-spacing:.5px}
 .row{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:8px}
+tr.g td{background:#21262d;padding-top:10px}
 .warn{display:none;background:#3b1d1d;border:1px solid #f85149;color:#ffb3ae;border-radius:8px;padding:10px 14px;margin-bottom:12px;font-size:13px}
 </style></head><body>
 <header><h1>🛡️ C3 AdBlock <span id=host></span></h1><span id=blockdot>🛡️</span><b id=blockstate data-on=1>Blocking active</b>
@@ -61,8 +62,9 @@ h2{font-size:13px;color:#8b949e;margin:18px 0 8px;letter-spacing:.5px}
 <h2>LIVE STATS <span class=m>(local filters: since restart &middot; servers: since the last save or restart)</span></h2>
 <div class=tw><table id=upt><thead><tr><th>#</th><th>Filter / server</th><th>Answers</th><th class=r>Failures</th><th class=r>Avg ms</th><th class=r>Max ms</th><th class=r>Timeout</th></tr></thead><tbody></tbody></table></div>
 <div class=m>Answered locally: <b id=lo>0</b> &middot; Failovers: <b id=fo>0</b> &middot; SERVFAIL (every server failed): <b id=sf>0</b></div>
-<h2>RECENT FAILURES <span class=m>(last 10 since restart; each one moved the lookup to the next server, or to SERVFAIL after the last)</span></h2>
-<div class=tw><table id=ft><thead><tr><th>When</th><th>Server</th><th>Reason</th><th>Name</th></tr></thead><tbody></tbody></table></div>
+<h2>RECENT <span class=m>(last 10 names per filter, newest first; a name asked again moves up and counts &middot; local filters: since restart &middot; servers: since the last save or restart)</span></h2>
+<div class=tw><table id=rt><thead><tr><th>When</th><th>Client</th><th>Name</th><th>What happened</th><th class=r>Times</th></tr></thead><tbody></tbody></table></div>
+<div class=m>A server failure moved the lookup to the next server, or to SERVFAIL after the last one.</div>
 </section>
 
 <section id=lists>
@@ -109,7 +111,7 @@ const $=id=>document.getElementById(id);let S={},META=null;
 const CSRF_HDRS={'X-Requested-With':'c3-adblock'}
 function tab(){let t=(location.hash||'#overview').slice(1);if(!$(t)||$(t).tagName!='SECTION')t='overview';
 document.querySelectorAll('section').forEach(s=>s.classList.toggle('on',s.id==t));document.querySelectorAll('nav a').forEach(a=>a.classList.toggle('on',a.hash=='#'+t))}
-addEventListener('hashchange',tab);tab();
+addEventListener('hashchange',()=>{tab();if(location.hash=='#dns')loadRecent()});tab();
 // Upstream picker: known resolvers + custom IP; 1 row in Single mode, up to 5 in Chain mode.
 const UPS=[['1.1.1.3','Cloudflare Families'],['1.0.0.3','Cloudflare Families #2'],['94.140.14.15','AdGuard Family'],['94.140.15.16','AdGuard Family #2'],
 ['208.67.222.123','Cisco OpenDNS FamilyShield'],['208.67.220.123','Cisco OpenDNS FamilyShield #2'],
@@ -173,7 +175,7 @@ s.ups.map((u,i)=>row('3.'+(i+1),esc(u.name)+' <span class=m>'+u.ip+'</span>'+(u.
  fmt(u.ok)+' answered',u.ok?'a':'',u.fail,u.ok?u.avg:'&mdash;',u.ok?u.max:'&mdash;',u.to+' ms')).join(''));
 const loc=(L.list||0)+(L.custom||0)+(L.ban||0),all=(L.checked||0)+(L.ban||0);
 lo.textContent=fmt(loc)+' of '+fmt(all)+(all?' ('+(100*loc/all).toFixed(1)+'%)':'');fo.textContent=fmt(s.failovers);sf.textContent=fmt(s.servfail);
-put(ft.tBodies[0],(s.fails||[]).map(f=>'<tr><td>'+(f.ago<120?f.ago+' s':Math.round(f.ago/60)+' min')+' ago</td><td>'+esc(f.up)+'</td><td class=b>'+esc(f.why)+'</td><td>'+esc(f.name)+'</td></tr>').join('')||'<tr><td colspan=4 class=m>none since restart</td></tr>');
+if($('dns').classList.contains('on'))loadRecent();
 put(ct.tBodies[0],s.clients.sort((a,b)=>(b.blocked+b.allowed)-(a.blocked+a.allowed)).map(c=>
 `<tr><td>${c.ip}${c.banned?' <span class=tag style=color:#f85149>BANNED</span>':''}</td><td>${c.mac}</td>
 <td class=b>${fmt(c.blocked)}</td><td class=a>${fmt(c.allowed)}</td><td>${c.ip==s.gw&&!c.banned?'<span class=m>router</span>':`<button class=ban data-ip="${c.ip}">${c.banned?'Unban':'Ban'}</button>`}</td></tr>`).join('')+
@@ -183,6 +185,20 @@ store.textContent='Storage: '+mb(s.fsUsed)+' of '+mb(s.fsTotal)+' used (list + s
 put(listsum,'<b>'+fmt(s.domains)+'</b> domains'+(META?' &middot; '+esc(META.preset||'custom')+' &middot; built '+esc(String(META.built||'?').slice(0,10)):'')+' &middot; storage '+mb(s.fsUsed)+' of '+mb(s.fsTotal));
 fwota.style.display=s.ota?'':'none';fwusb.style.display=s.ota?'none':'';fwmax.textContent=mb(s.otaMax||0);
 put(dev,'IP <b>'+s.ip+'</b> &middot; firmware built '+esc(s.build||'?')+(s.otaState=='pending'?' <b class=b>(new, not confirmed yet: it is once it answers a lookup)</b>':'')+' &middot; uptime '+s.uptime+' &middot; last start: '+esc(s.reset||'?')+' &middot; free RAM '+Math.round(s.heap/1024)+' KB &middot; '+s.temp+' °C &middot; Wi-Fi '+s.rssi+' dBm<br>Flash layout: '+(s.ota?'two app slots (firmware updates from this page)':'single app slot (USB updates only)')+' &middot; storage '+mb(s.fsUsed)+' of '+mb(s.fsTotal))}
+// RECENT: the last 10 names of every filter, grouped and numbered like LIVE STATS. /recent.json is only fetched while
+// the DNS tab is open. e.hit > 0: a parent domain matched (the rule is the end of the name from there).
+async function loadRecent(){let r=await fetch('/recent.json');if(!r.ok)return;let R=await r.json();
+const ago=a=>(a<120?a+' s':a<7200?Math.round(a/60)+' min':Math.round(a/3600)+' h')+' ago',
+via=e=>e.hit?' <span class=m>via '+esc(e.name.slice(e.hit))+'</span>':'',
+grp=(no,title,list,what,since)=>`<tr class=g><td colspan=5>${no} ${title}</td></tr>`+((list||[]).map(e=>
+`<tr><td>${ago(e.ago)}</td><td>${esc(e.ip)}</td><td>${esc(e.name)}</td><td>${what(e)}</td><td class=r>${fmt(e.n)}</td></tr>`).join('')||
+`<tr><td colspan=5 class=m>none since ${since||'restart'}</td></tr>`);
+put(rt.tBodies[0],
+grp(1,'<b>Local blocklist</b>',R.list,e=>'<span class=b>blocked</span>'+via(e))+
+grp(2,'<b>Custom blocks</b>',R.custom,e=>'<span class=b>blocked</span> <span class=m>by your rule '+esc(e.name.slice(e.hit))+'</span>')+
+grp(2,'<b>Exceptions</b>',R.allow,e=>'<span class=a>let through</span> <span class=m>by your exception '+esc(e.name.slice(e.hit))+'</span>')+
+((R.ban||[]).length?grp('&ndash;','<b>Banned devices</b>',R.ban,e=>'<span class=b>blocked</span> <span class=m>(device banned)</span>'):'')+
+(R.ups||[]).map((u,i)=>grp('3.'+(i+1),'<b>'+esc(u.name)+'</b> <span class=m>'+esc(u.ip)+' &middot; failures</span>',u.e,e=>'<span class=b>'+esc(e.why)+'</span>','the last save or restart')).join(''))}
 async function loadMeta(){let r=await fetch('/blocklist.json');META=null;
 if(!r.ok){meta.innerHTML='No details for this list (it was uploaded without <code>blocklist.json</code>).';return}
 try{let m=META=await r.json();meta.innerHTML='<b>'+fmt(+m.domains)+'</b> domains &middot; preset <b>'+esc(m.preset||'custom')+'</b> &middot; built '+esc(String(m.built||'?').replace('T',' ').slice(0,16))+
@@ -232,5 +248,6 @@ try{sessionStorage.setItem('fwFrom',S.build||'')}catch(_){}
 let r=await post('/update',f,fwmsg);
 if(r.ok||r.status==0){fwmsg.textContent='✓ uploaded, restarting… this page reloads in 20 s and then shows which build is running';setTimeout(()=>location.reload(),20000)}
 else{try{sessionStorage.removeItem('fwFrom')}catch(_){}fwmsg.textContent='✗ '+(r.text||'HTTP '+r.status)}};
-loadMeta();load();setInterval(load,3000);
+// No polling while the tab is hidden: a dashboard left open in the background asked the device every 3 s all day.
+loadMeta();load();setInterval(()=>{if(!document.hidden)load()},3000);document.addEventListener('visibilitychange',()=>{if(!document.hidden)load()});
 </script></body></html>)HTML";

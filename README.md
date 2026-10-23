@@ -38,10 +38,10 @@ SafeSearch), so names that are not on the local list are still covered.
 - **Family-safe upstream chain** — 1–5 DNS servers with their own timeouts; the next one is used only on timeout,
   SERVFAIL, REFUSED or a malformed reply. Dashboard presets; unfiltered or custom servers are flagged in red, and
   saving is refused if no server answers a test lookup.
-- **Asynchronous forwarding** — up to 16 lookups in flight and a 24-entry receive queue, so one slow server does not
-  stall the whole house.
+- **Asynchronous forwarding** — up to 16 lookups in flight, and incoming lookups are queued (~50 at once) the moment
+  they arrive, so a burst or one slow server does not stall the whole house.
 - **Dashboard** at `http://c3adblock.local` — Overview, DNS, Lists, Devices and System tabs: live per-filter and
-  per-server stats, recent failures, a domain tester, custom blocks and allow exceptions, pause, per-device ban,
+  per-server stats, the last 10 names each filter blocked, let through or failed on, a domain tester, custom blocks and allow exceptions, pause, per-device ban,
   blocklist upload and firmware update.
 - **Over-the-air updates** — two OTA app slots with automatic rollback if a new firmware does not come up healthy.
 - **PC toolkit** ([`tools/update.py`](tools/README.md), Python standard library only) — build lists from presets, add
@@ -130,7 +130,8 @@ The budget is the 1.31 MB LittleFS partition minus 64 KB for settings, about 250
 
 ## Security
 
-Read-only pages (`/`, `/stats.json`, `/blocklist.json`) are open on the LAN. Everything that changes state needs
+Read-only pages (`/`, `/stats.json`, `/recent.json`, `/blocklist.json`) are open on the LAN — including the recently
+blocked names per device on the DNS tab. Everything that changes state needs
 **HTTP Basic Auth** (`WEB_USER` / `WEB_PASS` from `secrets.h`) **and** the header `X-Requested-With: c3-adblock`,
 which a cross-site `<img>` or `<form>` cannot send. Five wrong passwords lock that client out for 60 s, requests with
 an unexpected `Host` header get HTTP 421 (DNS-rebinding protection), and the dashboard cannot be framed.
@@ -146,8 +147,8 @@ and Basic Auth is only base64. Never expose it to the internet, and replace the 
   be blocked this way.
 - No DNS over TCP; forwarded lookups ask for answers of at most 1232 bytes, so this rarely matters.
 - One list in storage: an upload replaces it, and DNS pauses while it is written.
-- Lookups arriving less than ~5 ms apart are partly dropped in the Wi-Fi driver (8 RX buffers in the prebuilt
-  Arduino framework). Normal home traffic is far below this.
+- About 50 lookups arriving at the same instant are queued; beyond that some are dropped. Normal home traffic is far
+  below this (a burst of 32 is answered in full).
 - 40-bit hashes can collide: about 0 false blocks at 180k domains, about 1 at 500k.
 
 ## Project layout

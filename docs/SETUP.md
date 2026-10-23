@@ -130,8 +130,11 @@ failovers, storage. Below: which DNS servers are in use and which blocklist is l
   - Red means something was blocked or failed; zero is never shown in red.
   - Below: *Answered locally* (blocked on the ESP32 without asking any server), failovers and SERVFAILs.
   Local numbers count since the last restart; server numbers since the last Save or restart.
-- **Recent failures:** the last 10 times a server failed (when, which server, why — timeout, SERVFAIL, REFUSED
-  or a bad reply — and the name). Look here when SERVFAIL or failovers go up.
+- **Recent:** the last 10 names of every filter, numbered like Live stats: what the local blocklist and your
+  custom blocks blocked (and which parent domain matched), what your exceptions let through, what banned devices
+  asked, and each server's failures (timeout, SERVFAIL, REFUSED or a bad reply). Each row shows when, which device
+  asked, and *Times*: a name asked again (a page asks for the same name several times) moves to the top and counts
+  up instead of filling the list. Look here when a site breaks or when SERVFAIL or failovers go up.
 
 ### Lists
 - **Test a domain:** type a name (e.g. `doubleclick.net`) → **Test**. It tells you *blocked by the local
@@ -282,6 +285,7 @@ Keep undo copies **outside the repo** (`*.bin` files are not committed):
 - Dashboard endpoints that change things need the login **and** the header `X-Requested-With: c3-adblock`:
   `/setupstream`, `/setlist`, `/addblock`, `/unblock`, `/addallow`, `/unallow`, `/test`, `/ban`, `/pause`, `/resume`,
   `/upload`, `/uploadmeta`, `/update`, `/forgetwifi`, plus `/auth` (only checks the login; the page calls it before
-  uploads, because the ESP32 cuts off uploads without a valid login). Read-only: `/`, `/stats.json`, `/blocklist.json`.
+  uploads, because the ESP32 cuts off uploads without a valid login). Read-only: `/`, `/stats.json`, `/recent.json`,
+  `/blocklist.json`.
 - 5 wrong passwords from one device lock it out for 60 s (HTTP 429). Requests for a host name other than
   `c3adblock.local`, `c3adblock`, the IP or a `.local`/`.lan`/`.home` name get HTTP 421 (protection against DNS rebinding).
